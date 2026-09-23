@@ -6,7 +6,7 @@
 """
 from datetime import datetime
 
-from sqlalchemy import DateTime, ForeignKey, String, func
+from sqlalchemy import DateTime, ForeignKey, String, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -66,6 +66,23 @@ class MatchSet(Base):
     away_points: Mapped[int]
 
     match: Mapped[Match] = relationship(back_populates="sets")
+
+
+class PlayerRating(Base):
+    """Elo rating snapshot per player per match.
+
+    Never a single "current rating" column — storing before/after per match
+    means any backtest can look up the rating that was valid at that moment.
+    """
+    __tablename__ = "player_ratings"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    player_id: Mapped[int] = mapped_column(ForeignKey("players.id"), index=True)
+    match_id: Mapped[int] = mapped_column(ForeignKey("matches.id"), index=True)
+    rating_before: Mapped[float]
+    rating_after: Mapped[float]
+
+    __table_args__ = (UniqueConstraint("player_id", "match_id"),)
 
 
 class RawEvent(Base):
