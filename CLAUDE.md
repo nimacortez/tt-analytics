@@ -5,7 +5,7 @@ Table tennis analytics and betting-research tool for four high-frequency leagues
 Stack
 Backend: Python 3.13, FastAPI, SQLAlchemy 2.0, psycopg, pydantic-settings
 DB: PostgreSQL 16 in Docker (docker-compose.yml at repo root)
-Frontend: Next.js + TypeScript (not built yet)
+Frontend: Next.js 16 (App Router) + TypeScript in frontend/, plain CSS, no UI libs
 No Redis until a real slow query justifies it
 Commands (run from backend/ with .venv active)
 bash
@@ -18,6 +18,7 @@ python -m app.predict             # log predictions for scheduled matches (as_of
 python -m app.grade               # grade finished matches; print Brier + calibration
 uvicorn app.main:app --reload     # API at http://localhost:8000/docs
 python -m pytest -q               # tests run on in-memory SQLite, no Docker needed
+cd frontend && npm run dev        # UI at http://localhost:3000 (needs the API running)
 Layout
 backend/app/
   config.py          settings from .env (DATA_PROVIDER=mock|betsapi)
@@ -33,11 +34,15 @@ backend/app/
   points.py          points-total model: exact P(total > line) + P(home wins) from P(home wins a point)
   predict.py         log_* functions write one predictions row per (match, market, line, model_version)
   grade.py           outcome_for() per market, grade_predictions(), brier_score(), calibration_table()
-  main.py            FastAPI: /health, /matches
+  main.py            FastAPI: /health, /leagues, /matches?line&n (model numbers per match),
+                     /matches/{id}?line&n (player stats, H2H, total distribution)
 backend/tests/
   conftest.py        `session` fixture: in-memory SQLite (JSONB patched to JSON)
   helpers.py         make_league / make_player / make_match(sets=[(h, a), ...]), NOW
 Every stat/model function gets a leakage test: a match at exactly as_of and one after it must be ignored.
+frontend/
+  lib/api.ts         typed fetch client (types mirror main.py's Pydantic models; keep in sync by hand)
+  app/page.tsx       match list; app/matches/[id]/page.tsx detail. Server Components, state in URL.
 Design rules (do not break these)
 Point-in-time correctness. Every stat/model function takes as_of and only uses matches with scheduled_at < as_of (full timestamp, not date: players play several matches a day). Backtests and the live app use the same functions.
 Store what the API gives; compute the rest. Total points, winner, hit rates are computed in queries, not stored. Exception: ratings.
@@ -62,9 +67,9 @@ League baselines load every league match in Python; fine at mock scale, first ca
 Points-total model (points.py). Each player's share of points over last 20 matches (set scores only, shrunk toward 0.5 with 50 points of prior) -> log5 -> P(home wins a point) -> exact distribution of match total (closed-form set scores + DP over best of 5; no Monte Carlo). Gives P(over) at any line and P(home wins). Design call: inputs are set-level, but the model assumes points are iid, which is point-level math; accepted deliberately. The mock generates data with exactly this assumption, so mock results flatter it; expect worse on real data.
 Totals results (line 74.5, n=4277): league over rate 0.2495, points model 0.2446, oracle 0.2406. Totals are mostly noise even with perfect knowledge; the model gets ~55% of the achievable gain. Oracle is well calibrated (math verified); model tails (p < 0.2, n~112) are too extreme. Shrinkage sweep (0/50/300/1000 points) didn't help, in-sample.
 Oracle (grade.py, mock only): true skills through the same exact model. Elo match_winner: 0.25 / 0.1955 / oracle 0.1873, so Elo gets ~87% of the achievable gain.
+Next.js UI: match list (league/status filters, adjustable line, form window) and match detail (Elo + points model cards, total distribution chart, per-player stats with CI/shrinkage/small-sample highlight). The API computes every model number with as_of = scheduled_at, same functions as backfill, so finished matches show the pre-match view. /matches with 100 rows takes ~1.7s (4-5 queries per match); fine for now, first thing to batch if it grows. Lines should be x.5: grading treats total == line as under (no push handling).
 
 Next (in order)
-Next.js UI (match list, filters by league, adjustable line).
 NL -> typed filter.
 Agent layer (open-ended questions only).
 Odds + EV (odds absent at first; design for missing odds).

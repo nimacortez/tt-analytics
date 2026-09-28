@@ -206,23 +206,45 @@ def player_set_stat(session: Session, stat: str, player_id: int, n: int,
     return _apply(SET_STATS[stat], views)
 
 
+def _league_views(session: Session, league_id: int,
+                  as_of: datetime) -> list[tuple[list[bool], bool]]:
+    return [(_set_wins(m, pid), _player_won_match(m, pid))
+            for m in _league_matches(session, league_id, as_of)
+            for pid in (m.home_player_id, m.away_player_id)]
+
+
 def league_set_stat(session: Session, stat: str, league_id: int,
                     as_of: datetime) -> tuple[int, int]:
     """(hits, qualifying player-matches) for SET_STATS[stat], league-wide baseline."""
-    views = [(_set_wins(m, pid), _player_won_match(m, pid))
-             for m in _league_matches(session, league_id, as_of)
-             for pid in (m.home_player_id, m.away_player_id)]
-    return _apply(SET_STATS[stat], views)
+    return _apply(SET_STATS[stat], _league_views(session, league_id, as_of))
+
+
+def _summary_with_baseline(hits: int, sample: int, lg_hits: int, lg_n: int) -> dict:
+    baseline = lg_hits / lg_n if lg_n else 0.5
+    result = summarize(hits, sample, baseline)
+    result["league_rate"] = round(baseline, 3)
+    return result
 
 
 def set_stat_summary(session: Session, stat: str, player_id: int, league_id: int,
                      n: int, as_of: datetime) -> dict:
     hits, sample = player_set_stat(session, stat, player_id, n, as_of)
-    lg_hits, lg_n = league_set_stat(session, stat, league_id, as_of)
-    baseline = lg_hits / lg_n if lg_n else 0.5
-    result = summarize(hits, sample, baseline)
-    result["league_rate"] = round(baseline, 3)
-    return result
+    return _summary_with_baseline(hits, sample, *league_set_stat(session, stat, league_id, as_of))
+
+
+def all_set_stat_summaries(session: Session, player_ids: list[int], league_id: int,
+                           n: int, as_of: datetime) -> dict[int, dict[str, dict]]:
+    """Every SET_STATS summary for several players, loading the league only once.
+    Returns {player_id: {stat: summary}}."""
+    views = _league_views(session, league_id, as_of)
+    league = {stat: _apply(rule, views) for stat, rule in SET_STATS.items()}
+    out: dict[int, dict[str, dict]] = {}
+    for pid in player_ids:
+        mine = [(_set_wins(m, pid), _player_won_match(m, pid))
+                for m in _player_matches(session, pid, n, as_of)]
+        out[pid] = {stat: _summary_with_baseline(*_apply(rule, mine), *league[stat])
+                    for stat, rule in SET_STATS.items()}
+    return out
 
 
 # ---------------------------------------------------------------------------
