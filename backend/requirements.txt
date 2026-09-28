@@ -5,3 +5,5 @@ psycopg[binary]
 pydantic>=2
 pydantic-settings
 scipy
+pytest
+httpx

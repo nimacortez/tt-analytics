@@ -85,6 +85,29 @@ class PlayerRating(Base):
     __table_args__ = (UniqueConstraint("player_id", "match_id"),)
 
 
+class Prediction(Base):
+    """One row per (match, market, line, model_version) prediction."""
+
+    __tablename__ = "predictions"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    match_id: Mapped[int] = mapped_column(ForeignKey("matches.id"), index=True)
+    market: Mapped[str] = mapped_column(String(40))
+    line: Mapped[float] = mapped_column(default=-1.0)   # -1.0 = no line
+    model_name: Mapped[str] = mapped_column(String(40))
+    model_version: Mapped[str] = mapped_column(String(20))
+    probability: Mapped[float]
+    as_of: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    inputs: Mapped[dict] = mapped_column(JSONB)
+    outcome: Mapped[bool | None] = mapped_column(nullable=True)
+    graded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    __table_args__ = (UniqueConstraint("match_id", "market", "line", "model_version"),)
+
+
 class RawEvent(Base):
     """Every payload exactly as the provider sent it. Lets you reprocess history later
     (new fields, bug fixes) without re-fetching or paying again."""

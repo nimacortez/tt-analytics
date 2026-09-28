@@ -1,11 +1,6 @@
-"""Elo ratings, computed chronologically from finished matches.
-
-Run:  python -m app.elo          (recomputes everything from scratch)
-      python -m app.elo --check  (also prints rank correlation vs mock true_skill)
-
-Design: full recompute, not incremental. Wipes player_ratings and rebuilds in
-one pass so the table is always consistent. Fast enough for mock-scale data;
-add incremental updates when real-time latency matters.
+"""
+Elo ratings. Run: python -m app.ratings [--k 32] [--check]
+--check also prints Spearman rank correlation vs mock true_skill().
 """
 import argparse
 from datetime import datetime
@@ -18,15 +13,18 @@ from app.db import SessionLocal
 from app.models import Match, Player, PlayerRating
 
 DEFAULT_RATING = 1500.0
-K = 32.0
 
 
-def _expected(r_a: float, r_b: float) -> float:
-    return 1.0 / (1.0 + 10.0 ** ((r_b - r_a) / 400.0))
+def p_win(rating_a: float, rating_b: float) -> float:
+    """Standard Elo win probability: P(a beats b)."""
+    return 1.0 / (1.0 + 10.0 ** ((rating_b - rating_a) / 400.0))
 
 
-def compute_elo(session: Session) -> dict[int, float]:
-    """Recompute all Elo ratings from scratch. Returns {player_id: final_rating}."""
+def rebuild(session: Session, k: float = 32.0) -> dict[int, float]:
+    """Wipe player_ratings and rebuild from scratch in chronological order.
+
+    Returns {player_id: final_rating}.
+    """
     session.execute(delete(PlayerRating))
 
     matches = session.scalars(
@@ -39,16 +37,17 @@ def compute_elo(session: Session) -> dict[int, float]:
     rows: list[PlayerRating] = []
 
     for m in matches:
-        h_id, a_id = m.home_player_id, m.away_player_id
+        h_id = m.home_player_id
+        a_id = m.away_player_id
         h_before = ratings.get(h_id, DEFAULT_RATING)
         a_before = ratings.get(a_id, DEFAULT_RATING)
 
         home_won = (m.home_sets_won or 0) > (m.away_sets_won or 0)
         h_score = 1.0 if home_won else 0.0
 
-        e_home = _expected(h_before, a_before)
-        h_after = h_before + K * (h_score - e_home)
-        a_after = a_before + K * ((1.0 - h_score) - (1.0 - e_home))
+        e_home = p_win(h_before, a_before)
+        h_after = h_before + k * (h_score - e_home)
+        a_after = a_before + k * ((1.0 - h_score) - (1.0 - e_home))
 
         ratings[h_id] = h_after
         ratings[a_id] = a_after
@@ -65,9 +64,11 @@ def compute_elo(session: Session) -> dict[int, float]:
     return ratings
 
 
-def current_rating(session: Session, player_id: int, as_of: datetime) -> float:
-    """Latest rating_after for this player in matches before as_of.
-    Returns DEFAULT_RATING if the player has never been rated."""
+def rating_as_of(session: Session, player_id: int, as_of: datetime) -> float:
+    """Return the rating_after from the most recent match before as_of (strict <).
+
+    Returns DEFAULT_RATING if no qualifying rows exist.
+    """
     row = session.scalars(
         select(PlayerRating)
         .join(Match, Match.id == PlayerRating.match_id)
@@ -80,8 +81,7 @@ def current_rating(session: Session, player_id: int, as_of: datetime) -> float:
 
 
 def check_vs_true_skill(ratings: dict[int, float]) -> None:
-    """Print Spearman rank correlation between final Elo and mock true_skill.
-    Operates per-league so the different skill pools don't blur the signal."""
+    """Print per-league Spearman ρ between final Elo and mock true_skill."""
     from app.providers.mock import MockProvider
     provider = MockProvider()
 
@@ -92,7 +92,6 @@ def check_vs_true_skill(ratings: dict[int, float]) -> None:
     by_league: dict[str, list[tuple[float, float]]] = {}
     for pid, elo in ratings.items():
         api_id = pid_to_api.get(pid, "")
-        # api_id format: "mock-{league}-p{nn}"
         parts = api_id.rsplit("-p", 1)
         if len(parts) != 2:
             continue
@@ -119,13 +118,14 @@ def check_vs_true_skill(ratings: dict[int, float]) -> None:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="Rebuild Elo ratings")
+    parser.add_argument("--k", type=float, default=32.0, help="K-factor (default 32)")
     parser.add_argument("--check", action="store_true",
-                        help="also print rank correlation vs mock true_skill")
+                        help="print Spearman correlation vs mock true_skill")
     args = parser.parse_args()
 
     with SessionLocal() as session:
-        ratings = compute_elo(session)
+        final_ratings = rebuild(session, k=args.k)
 
     if args.check:
-        check_vs_true_skill(ratings)
+        check_vs_true_skill(final_ratings)
