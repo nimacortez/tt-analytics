@@ -50,7 +50,7 @@ Ratings get their own table (player_ratings: player_id, match_id, rating_before,
 Stats use status == "finished" only. Walkovers and retirements are excluded.
 Return sample sizes, not bare percentages. Stats return (hits, n); display layers add Wilson intervals and shrinkage toward the league baseline.
 Grain is set-level. No point-level modelling. Every raw provider payload is kept in raw_events (JSONB) so history can be reprocessed.
-Providers are swappable. Only providers/ knows about external APIs; everything else sees ProviderEvent. The mock's raw payload shape is made up; the real BetsAPI shape must be checked against their docs when the key arrives.
+Providers are swappable. Only providers/ knows about external APIs; everything else sees ProviderEvent. The mock's raw payload shape is made up; real BetsAPI payloads are in backend/samples/ (see step 6).
 The stats layer is never an LLM.
 Where an LLM is and isn't the right tool
 Deterministic pipeline (fixtures -> history -> ratings -> odds -> edge): plain functions, NOT an agent.
@@ -58,24 +58,34 @@ Natural-language queries: the LLM outputs a typed, Pydantic-validated filter obj
 Agents only for open-ended research questions where the path genuinely varies.
 Point these calls out explicitly when they come up.
 Status
+Step numbers below are canonical. Refer to them as "step N" in prompts and commit messages (feat(step-N): ...).
 
-Done: schema, provider interface, mock provider, ingestion, /matches API, over/under hit rate with Wilson CI + shrinkage (over_summary, prior_strength=10 is a guess).
-pytest suite (tests/). Elo (ratings.py, K=32, start 1500): Spearman rho vs true_skill on 30 days of mock data = czech 0.930, elite 0.906, setka 0.850, ttcup 0.889. Mock points are iid given skill, so real data will be noisier.
-Predictions table + logging + grading. Markets: match_winner (probability = P(home wins), line = -1 sentinel so the unique key works) and total_over (P(total > line)). Grading is per market; walkovers/retirements are never graded. Elo v1 match_winner: Brier 0.1955 vs 0.25 coin flip, n=4277, calibration within ~3pts per decile. New market = add a branch in grade.outcome_for() + a test.
-Set-sequence stats: each is a rule (sets won in order, won match) -> None/hit/miss in stats.SET_STATS. Player version = last n finished matches, then filter to qualifying ones (so n_qualifying <= n); league baseline = all league matches from both players' sides (n = player-matches). Split = loser of set 1 wins set 2. Three versions: split (match-level), split_after_losing_set1, split_allowed_after_winning_set1. League-wide all three rates are equal by construction (~0.426 on mock); only the player-level versions carry information, and each qualifies on ~half of matches, so samples are small. New stat = one entry in SET_STATS + expected value in tests/test_advanced_stats.py (a test fails if it's missing).
-League baselines load every league match in Python; fine at mock scale, first candidate for SQL/caching if the API gets slow.
-Points-total model (points.py). Each player's share of points over last 20 matches (set scores only, shrunk toward 0.5 with 50 points of prior) -> log5 -> P(home wins a point) -> exact distribution of match total (closed-form set scores + DP over best of 5; no Monte Carlo). Gives P(over) at any line and P(home wins). Design call: inputs are set-level, but the model assumes points are iid, which is point-level math; accepted deliberately. The mock generates data with exactly this assumption, so mock results flatter it; expect worse on real data.
-Totals results (line 74.5, n=4277): league over rate 0.2495, points model 0.2446, oracle 0.2406. Totals are mostly noise even with perfect knowledge; the model gets ~55% of the achievable gain. Oracle is well calibrated (math verified); model tails (p < 0.2, n~112) are too extreme. Shrinkage sweep (0/50/300/1000 points) didn't help, in-sample.
-Oracle (grade.py, mock only): true skills through the same exact model. Elo match_winner: 0.25 / 0.1955 / oracle 0.1873, so Elo gets ~87% of the achievable gain.
-Next.js UI: match list (league/status filters, adjustable line, form window) and match detail (Elo + points model cards, total distribution chart, per-player stats with CI/shrinkage/small-sample highlight). The API computes every model number with as_of = scheduled_at, same functions as backfill, so finished matches show the pre-match view. /matches with 100 rows takes ~1.7s (4-5 queries per match); fine for now, first thing to batch if it grows. Lines should be x.5: grading treats total == line as under (no push handling).
+Done (all merged to main, 102 tests passing)
+Step 0 - Tests. pytest on in-memory SQLite (tests/conftest.py, tests/helpers.py). Every stat/model function has a leakage test (a match at exactly as_of and one after it are ignored; retired/walkover ignored).
+Step 1 - Elo (ratings.py, K=32, start 1500, full chronological rebuild into player_ratings). Spearman rho vs mock true_skill: czech 0.964, elite 0.861, setka 0.876, ttcup 0.897 (all 0.903), on data to 2026-09-28. Mock points are iid given skill, so real data will be noisier.
+Step 2 - Predictions + grading (predict.py, grade.py). Markets: match_winner (probability = P(home wins), line = -1 sentinel so the unique key works) and total_over (P(total > line)). Grading is per market (grade.outcome_for); walkovers/retirements never graded. New market = a branch in outcome_for() + a test. Lines should be x.5: total == line grades as under (no push handling).
+Step 3 - Set-sequence stats (stats.SET_STATS rule table): sweep, win after set 1 win/loss, win at 1-1 from 1-0, set 3 when up 2-0, set 5, and splits. Split = loser of set 1 wins set 2; three versions: split (match-level), split_after_losing_set1, split_allowed_after_winning_set1. Player version = last n finished matches, then filter to qualifying (n_qualifying <= n); league baseline = all league matches from both players' sides (n = player-matches). League-wide the three split rates are equal by construction (~0.426 on mock); only player-level versions carry information, on ~half of matches each. Plus h2h_record, avg_total_points (+ shrunk mean). New stat = one SET_STATS entry + expected value in tests/test_advanced_stats.py (a test fails if missing).
+Step 4 - Points-total model (points.py). Player's share of points over last 20 matches (set scores only, shrunk to 0.5 with 50 points of prior) -> log5 -> P(home wins a point) -> exact match-total distribution (closed-form set scores + DP over best of 5, no Monte Carlo). Gives P(over) at any line and P(home wins). Design call: inputs are set-level but the model assumes iid points (point-level math); accepted deliberately. The mock generates data with exactly this assumption, so mock results flatter it.
+Step 5 - UI + API. FastAPI /leagues, /matches?line&n, /matches/{id}?line&n; every model number computed with as_of = scheduled_at (same functions as backfill). Next.js 16 frontend/: match list (league/status filters, adjustable line, form window) and match detail (model cards, total distribution chart, per-player stats with CI/shrinkage/small-sample highlight). Server Components, state in the URL.
+
+Model scoreboard (mock data, as_of = kickoff, burn-in 10 matches per player; python -m app.grade)
+match_winner, n=5082: always 0.5 = 0.2500 | Elo v1 = 0.1952 | oracle = 0.1874 -> Elo gets ~87% of achievable gain. Calibration within ~3pts per decile.
+total_over 74.5, n=5082: league over rate = 0.2496 | points model v1 = 0.2455 | oracle = 0.2413 -> ~50% of achievable gain. Totals are mostly noise even with perfect knowledge. Oracle is well calibrated (math verified); model tails are too extreme (p < 0.2 bins, n=124: predicted ~0.15, actual ~0.25). Shrinkage sweep (0-1000 points) didn't fix it.
+Oracle (grade.py, mock only): true skills through the same exact model = best achievable Brier.
+
+Known limitations
+/matches with 100 rows ~1.7s (4-5 queries per match); league baselines load every league match in Python. First things to batch/cache if the API gets slow.
+frontend/lib/api.ts types mirror main.py's Pydantic models by hand; no codegen.
+No Alembic: schema changes need init_db --reset + re-ingest.
 
 Next (in order)
-NL -> typed filter.
-Agent layer (open-ended questions only).
-Odds + EV (odds absent at first; design for missing odds).
-Tracing: token cost, latency.
+Step 6 - Real data: BetsAPI provider. BETSAPI_TOKEN is in .env; real payloads are in backend/samples/ (ended.json, upcoming.json: {success, pager, results[]}, event keys id, league, home, away, time (unix), time_status, ss, scores). Write providers/betsapi.py mapping to ProviderEvent (confirm time_status codes, per-set scores format, retirement/walkover signals against BetsAPI docs, and league ids for the 4 leagues). Parser tests run against the sample files. Then backfill real history, rerun steps 1-4 on it, and record the real scoreboard next to the mock one. Oracle doesn't exist on real data.
+Step 7 - NL -> typed filter. LLM outputs a Pydantic-validated filter object (league, players, date range, line, stat thresholds); code turns it into SQL; the LLM never writes SQL. Build an eval set of question -> expected filter pairs first and score exact-match on fields. Log token cost + latency per call from the first call (start of step 10).
+Step 8 - Agent layer, only for open-ended research questions where the path genuinely varies. Tools = the existing plain functions (stats, ratings, points model, predictions). Not for the deterministic pipeline.
+Step 9 - Odds + EV. Store odds snapshots per (match, market, line, bookmaker, fetched_at); design for missing odds. Edge = model probability - implied probability (de-vigged). Log bets-that-would-have-been-placed as predictions so closing-line value and ROI are graded like everything else.
+Step 10 - Tracing: token cost, latency, per LLM/agent call. Minimal version ships with step 7; this step is the dashboard/aggregation.
 
-Housekeeping when convenient: Alembic once the schema settles; batch upserts in ingest (currently row-by-row).
+Housekeeping when convenient: Alembic once the schema settles; batch upserts in ingest (currently row-by-row); batch the /matches model queries.
 
 How to work with Nima
 Full-stack engineer (TypeScript/React/Node/Postgres), rusty on backend setup, newer to Python.
