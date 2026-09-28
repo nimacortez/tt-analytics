@@ -12,17 +12,24 @@ bash
 docker compose up -d              # from repo root; Docker Desktop must be running
 python -m app.init_db             # create tables (--reset to drop first)
 python -m app.ingest --days 30    # load mock data
+python -m app.ratings --check     # rebuild Elo; print Spearman rho vs mock true_skill
 uvicorn app.main:app --reload     # API at http://localhost:8000/docs
+python -m pytest -q               # tests run on in-memory SQLite, no Docker needed
 Layout
 backend/app/
   config.py          settings from .env (DATA_PROVIDER=mock|betsapi)
   db.py              engine, SessionLocal, Base
-  models.py          leagues, players, matches, match_sets, raw_events
+  models.py          leagues, players, matches, match_sets, player_ratings, raw_events
   providers/base.py  provider contract: ProviderEvent etc. + DataProvider Protocol
   providers/mock.py  point-by-point simulation with hidden per-player skill
   ingest.py          provider -> Postgres via upserts keyed on api_id
   stats.py           over_hit_rate, league_over_rate, wilson_interval, shrunk_rate, over_summary
+  ratings.py         Elo: rebuild() full chronological recompute, rating_as_of(), p_win()
   main.py            FastAPI: /health, /matches
+backend/tests/
+  conftest.py        `session` fixture: in-memory SQLite (JSONB patched to JSON)
+  helpers.py         make_league / make_player / make_match(sets=[(h, a), ...]), NOW
+Every stat/model function gets a leakage test: a match at exactly as_of and one after it must be ignored.
 Design rules (do not break these)
 Point-in-time correctness. Every stat/model function takes as_of and only uses matches with scheduled_at < as_of (full timestamp, not date: players play several matches a day). Backtests and the live app use the same functions.
 Store what the API gives; compute the rest. Total points, winner, hit rates are computed in queries, not stored. Exception: ratings.
@@ -40,9 +47,9 @@ Point these calls out explicitly when they come up.
 Status
 
 Done: schema, provider interface, mock provider, ingestion, /matches API, over/under hit rate with Wilson CI + shrinkage (over_summary, prior_strength=10 is a guess).
+pytest suite (tests/). Elo (ratings.py, K=32, start 1500): Spearman rho vs true_skill on 30 days of mock data = czech 0.930, elite 0.906, setka 0.850, ttcup 0.889. Mock points are iid given skill, so real data will be noisier.
 
 Next (in order)
-Elo: player_ratings table, computed chronologically. Validate against the mock's true_skill() (rating order should correlate strongly with hidden skill).
 predictions table + logging, started NOW rather than at the end: what was predicted, model probability, model version, inputs/as_of, created_at; graded later against results. Brier score + calibration from day one.
 More stats with the same as_of + shrinkage pattern: H2H, sweeps %, splits %, set conditionals (win % if up 1-0, set 3 sweep when up 2-0, set 5 at 2-2), avg total points.
 Points-total distribution model (for P(over line) at any line).
