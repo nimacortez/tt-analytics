@@ -26,7 +26,9 @@ backend/app/
   providers/base.py  provider contract: ProviderEvent etc. + DataProvider Protocol
   providers/mock.py  point-by-point simulation with hidden per-player skill
   ingest.py          provider -> Postgres via upserts keyed on api_id
-  stats.py           over_hit_rate, league_over_rate, wilson_interval, shrunk_rate, over_summary
+  stats.py           wilson_interval, shrunk_rate, summarize; over/under; SET_STATS rule table
+                     (sweep, set conditionals, 3 split variants) via player_set_stat /
+                     league_set_stat / set_stat_summary; h2h_record; avg_total_points (+ summary)
   ratings.py         Elo: rebuild() full chronological recompute, rating_as_of(), p_win()
   predict.py         log_* functions write one predictions row per (match, market, line, model_version)
   grade.py           outcome_for() per market, grade_predictions(), brier_score(), calibration_table()
@@ -54,9 +56,10 @@ Status
 Done: schema, provider interface, mock provider, ingestion, /matches API, over/under hit rate with Wilson CI + shrinkage (over_summary, prior_strength=10 is a guess).
 pytest suite (tests/). Elo (ratings.py, K=32, start 1500): Spearman rho vs true_skill on 30 days of mock data = czech 0.930, elite 0.906, setka 0.850, ttcup 0.889. Mock points are iid given skill, so real data will be noisier.
 Predictions table + logging + grading. Markets: match_winner (probability = P(home wins), line = -1 sentinel so the unique key works) and total_over (P(total > line)). Grading is per market; walkovers/retirements are never graded. Elo v1 match_winner: Brier 0.1955 vs 0.25 coin flip, n=4277, calibration within ~3pts per decile. New market = add a branch in grade.outcome_for() + a test.
+Set-sequence stats: each is a rule (sets won in order, won match) -> None/hit/miss in stats.SET_STATS. Player version = last n finished matches, then filter to qualifying ones (so n_qualifying <= n); league baseline = all league matches from both players' sides (n = player-matches). Split = loser of set 1 wins set 2. Three versions: split (match-level), split_after_losing_set1, split_allowed_after_winning_set1. League-wide all three rates are equal by construction (~0.426 on mock); only the player-level versions carry information, and each qualifies on ~half of matches, so samples are small. New stat = one entry in SET_STATS + expected value in tests/test_advanced_stats.py (a test fails if it's missing).
+League baselines load every league match in Python; fine at mock scale, first candidate for SQL/caching if the API gets slow.
 
 Next (in order)
-More stats with the same as_of + shrinkage pattern: H2H, sweeps %, splits %, set conditionals (win % if up 1-0, set 3 sweep when up 2-0, set 5 at 2-2), avg total points.
 Points-total distribution model (for P(over line) at any line).
 Next.js UI (match list, filters by league, adjustable line).
 NL -> typed filter.
@@ -64,7 +67,7 @@ Agent layer (open-ended questions only).
 Odds + EV (odds absent at first; design for missing odds).
 Tracing: token cost, latency.
 
-Housekeeping when convenient: Alembic once the schema settles; batch upserts in ingest (currently row-by-row); pytest tests for stats functions against known mock data.
+Housekeeping when convenient: Alembic once the schema settles; batch upserts in ingest (currently row-by-row).
 
 How to work with Nima
 Full-stack engineer (TypeScript/React/Node/Postgres), rusty on backend setup, newer to Python.

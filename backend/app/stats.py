@@ -1,4 +1,5 @@
 import math
+from collections.abc import Callable
 from datetime import datetime
 
 from sqlalchemy import func, or_, select
@@ -105,12 +106,62 @@ def over_summary(session: Session, player_id: int, league_id: int, line: float,
 
 
 # ---------------------------------------------------------------------------
-# Match-loading helpers
+# Set-sequence stats: sweeps, set conditionals, splits
+#
+# Every stat here is a rule over one player's view of a finished match:
+#   sets = [won set 1?, won set 2?, ...], won = won the match?
+# The rule returns None if the match doesn't qualify (not in the denominator),
+# else True/False for hit/miss.
+#
+# Player stat: last n finished matches before as_of, then keep the qualifying
+# ones, so conditional stats have n_qualifying <= n. Same window for every stat.
+# League baseline: every finished league match before as_of, seen from BOTH
+# players' sides, so its n counts player-matches (up to 2x matches).
 # ---------------------------------------------------------------------------
+
+SetRule = Callable[[list[bool], bool], bool | None]
+
+
+def _two(sets: list[bool]) -> bool:
+    return len(sets) >= 2
+
+
+SET_STATS: dict[str, SetRule] = {
+    # Match ended 3-0 either way.
+    "sweep": lambda s, won: len(s) == 3,
+    # Won the match after winning / losing set 1.
+    "win_after_set1_win": lambda s, won: won if s[0] else None,
+    "win_after_set1_loss": lambda s, won: won if not s[0] else None,
+    # Led 1-0, got pegged back to 1-1: won the match anyway?
+    "win_after_1_1_from_1_0": lambda s, won: won if _two(s) and s[0] and not s[1] else None,
+    # Up 2-0: took set 3 (i.e. closed out the sweep)?
+    "set3_win_when_up_2_0": lambda s, won: s[2] if len(s) >= 3 and s[0] and s[1] else None,
+    # Went to a decider at 2-2: won set 5?
+    "set5_win": lambda s, won: won if len(s) == 5 else None,
+    # Split = the loser of set 1 wins set 2 (1-1 after two sets).
+    "split": lambda s, won: s[0] != s[1] if _two(s) else None,
+    # Player lost set 1, won set 2.
+    "split_after_losing_set1": lambda s, won: s[1] if _two(s) and not s[0] else None,
+    # Player won set 1, lost set 2.
+    "split_allowed_after_winning_set1": lambda s, won: not s[1] if _two(s) and s[0] else None,
+}
+
+
+def _set_wins(match: Match, player_id: int) -> list[bool]:
+    """Did the player win each set, in set order?"""
+    is_home = match.home_player_id == player_id
+    return [(s.home_points > s.away_points) == is_home
+            for s in sorted(match.sets, key=lambda x: x.set_number)]
+
+
+def _player_won_match(match: Match, player_id: int) -> bool:
+    home_won = (match.home_sets_won or 0) > (match.away_sets_won or 0)
+    return home_won == (match.home_player_id == player_id)
+
 
 def _player_matches(session: Session, player_id: int, n: int,
                     as_of: datetime) -> list[Match]:
-    """Return the player's last n finished matches before as_of, sets preloaded."""
+    """The player's last n finished matches before as_of, sets preloaded."""
     stmt = (
         select(Match)
         .where(or_(Match.home_player_id == player_id, Match.away_player_id == player_id))
@@ -123,388 +174,127 @@ def _player_matches(session: Session, player_id: int, n: int,
     return list(session.scalars(stmt).all())
 
 
-def _set_wins(match: Match, player_id: int) -> list[bool]:
-    """Per-set boolean: did the player win each set (in set-number order)?"""
-    is_home = match.home_player_id == player_id
-    return [
-        (s.home_points > s.away_points) if is_home else (s.away_points > s.home_points)
-        for s in sorted(match.sets, key=lambda x: x.set_number)
-    ]
-
-
-def _player_won_match(match: Match, player_id: int) -> bool:
-    if match.home_player_id == player_id:
-        return (match.home_sets_won or 0) > (match.away_sets_won or 0)
-    return (match.away_sets_won or 0) > (match.home_sets_won or 0)
-
-
-# ---------------------------------------------------------------------------
-# H2H
-# ---------------------------------------------------------------------------
-
-def h2h_record(
-    session: Session, player_a_id: int, player_b_id: int, n: int, as_of: datetime
-) -> tuple[int, int]:
-    """Of last n finished H2H matches before as_of, how many did player_a win?
-    Returns (wins_a, total).
-    """
+def _league_matches(session: Session, league_id: int, as_of: datetime) -> list[Match]:
     stmt = (
         select(Match)
-        .where(
-            or_(
-                (Match.home_player_id == player_a_id) & (Match.away_player_id == player_b_id),
-                (Match.home_player_id == player_b_id) & (Match.away_player_id == player_a_id),
-            )
-        )
+        .where(Match.league_id == league_id)
+        .where(Match.status == "finished")
+        .where(Match.scheduled_at < as_of)
+        .options(selectinload(Match.sets))
+    )
+    return list(session.scalars(stmt).all())
+
+
+def _apply(rule: SetRule, views: list[tuple[list[bool], bool]]) -> tuple[int, int]:
+    hits = n = 0
+    for sets, won in views:
+        if not sets:
+            continue
+        result = rule(sets, won)
+        if result is None:
+            continue
+        n += 1
+        hits += bool(result)
+    return hits, n
+
+
+def player_set_stat(session: Session, stat: str, player_id: int, n: int,
+                    as_of: datetime) -> tuple[int, int]:
+    """(hits, qualifying matches) for SET_STATS[stat] over the player's last n matches."""
+    views = [(_set_wins(m, player_id), _player_won_match(m, player_id))
+             for m in _player_matches(session, player_id, n, as_of)]
+    return _apply(SET_STATS[stat], views)
+
+
+def league_set_stat(session: Session, stat: str, league_id: int,
+                    as_of: datetime) -> tuple[int, int]:
+    """(hits, qualifying player-matches) for SET_STATS[stat], league-wide baseline."""
+    views = [(_set_wins(m, pid), _player_won_match(m, pid))
+             for m in _league_matches(session, league_id, as_of)
+             for pid in (m.home_player_id, m.away_player_id)]
+    return _apply(SET_STATS[stat], views)
+
+
+def set_stat_summary(session: Session, stat: str, player_id: int, league_id: int,
+                     n: int, as_of: datetime) -> dict:
+    hits, sample = player_set_stat(session, stat, player_id, n, as_of)
+    lg_hits, lg_n = league_set_stat(session, stat, league_id, as_of)
+    baseline = lg_hits / lg_n if lg_n else 0.5
+    result = summarize(hits, sample, baseline)
+    result["league_rate"] = round(baseline, 3)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Head to head
+# ---------------------------------------------------------------------------
+
+def h2h_record(session: Session, player_a_id: int, player_b_id: int, n: int,
+               as_of: datetime) -> tuple[int, int]:
+    """Of the last n finished meetings before as_of, how many did player_a win?
+    Returns (wins_a, meetings). Baseline for shrinkage is 0.5 (or an Elo p_win)."""
+    stmt = (
+        select(Match)
+        .where(or_(
+            (Match.home_player_id == player_a_id) & (Match.away_player_id == player_b_id),
+            (Match.home_player_id == player_b_id) & (Match.away_player_id == player_a_id),
+        ))
         .where(Match.status == "finished")
         .where(Match.scheduled_at < as_of)
         .order_by(Match.scheduled_at.desc())
         .limit(n)
     )
     matches = session.scalars(stmt).all()
-    wins = sum(1 for m in matches if _player_won_match(m, player_a_id))
-    return wins, len(matches)
+    return sum(_player_won_match(m, player_a_id) for m in matches), len(matches)
 
 
 # ---------------------------------------------------------------------------
-# Sweep rate
+# Average total points (a mean, not a rate)
 # ---------------------------------------------------------------------------
 
-def sweep_rate(
-    session: Session, player_id: int, n: int, as_of: datetime
-) -> tuple[int, int]:
-    """Of last n finished matches, how many ended 3-0 (either direction)?
-    Returns (sweeps, total).
-    """
+def _match_total(m: Match) -> int:
+    return sum(s.home_points + s.away_points for s in m.sets)
+
+
+def avg_total_points(session: Session, player_id: int, n: int,
+                     as_of: datetime) -> tuple[int, int]:
+    """(sum of total points, matches) over the player's last n finished matches."""
     matches = _player_matches(session, player_id, n, as_of)
-    sweeps = sum(
-        1 for m in matches
-        if (m.home_sets_won == 3 and m.away_sets_won == 0)
-        or (m.home_sets_won == 0 and m.away_sets_won == 3)
+    return sum(_match_total(m) for m in matches), len(matches)
+
+
+def league_avg_total_points(session: Session, league_id: int,
+                            as_of: datetime) -> tuple[int, int]:
+    """(sum of total points, matches) league-wide before as_of."""
+    totals = (
+        select(MatchSet.match_id,
+               func.sum(MatchSet.home_points + MatchSet.away_points).label("total"))
+        .group_by(MatchSet.match_id)
+        .subquery()
     )
-    return sweeps, len(matches)
-
-
-def league_sweep_rate(
-    session: Session, league_id: int, as_of: datetime
-) -> tuple[int, int]:
-    """League-wide baseline for sweep rate. Returns (sweeps, total)."""
     stmt = (
-        select(
-            func.count(),
-            func.count().filter(
-                ((Match.home_sets_won == 3) & (Match.away_sets_won == 0))
-                | ((Match.home_sets_won == 0) & (Match.away_sets_won == 3))
-            )
-        )
+        select(func.coalesce(func.sum(totals.c.total), 0), func.count())
+        .select_from(Match)
+        .join(totals, totals.c.match_id == Match.id)
         .where(Match.league_id == league_id)
         .where(Match.status == "finished")
         .where(Match.scheduled_at < as_of)
     )
-    total, sweeps = session.execute(stmt).one()
-    return sweeps, total
+    total, count = session.execute(stmt).one()
+    return int(total), count
 
 
-# ---------------------------------------------------------------------------
-# Set-1 conditionals
-# ---------------------------------------------------------------------------
-
-def win_after_set1_win(
-    session: Session, player_id: int, n: int, as_of: datetime
-) -> tuple[int, int]:
-    """Of last n matches where player won set 1, how many did player win the match?
-    Returns (match_wins, total_where_won_set1).
-    """
-    matches = _player_matches(session, player_id, n, as_of)
-    total = wins = 0
-    for m in matches:
-        sw = _set_wins(m, player_id)
-        if sw and sw[0]:
-            total += 1
-            if _player_won_match(m, player_id):
-                wins += 1
-    return wins, total
-
-
-def win_after_set1_loss(
-    session: Session, player_id: int, n: int, as_of: datetime
-) -> tuple[int, int]:
-    """Of last n matches where player lost set 1, how many did player win the match?
-    Returns (match_wins, total_where_lost_set1).
-    """
-    matches = _player_matches(session, player_id, n, as_of)
-    total = wins = 0
-    for m in matches:
-        sw = _set_wins(m, player_id)
-        if sw and not sw[0]:
-            total += 1
-            if _player_won_match(m, player_id):
-                wins += 1
-    return wins, total
-
-
-def league_win_after_set1_win(
-    session: Session, league_id: int, as_of: datetime
-) -> tuple[int, int]:
-    """League baseline: matches where set-1 winner won the match.
-    Returns (set1_winner_also_won_match, total_finished).
-    """
-    matches = session.scalars(
-        select(Match)
-        .where(Match.league_id == league_id)
-        .where(Match.status == "finished")
-        .where(Match.scheduled_at < as_of)
-        .options(selectinload(Match.sets))
-    ).all()
-    total = wins = 0
-    for m in matches:
-        if not m.sets:
-            continue
-        s1 = min(m.sets, key=lambda s: s.set_number)
-        home_won_set1 = s1.home_points > s1.away_points
-        home_won_match = (m.home_sets_won or 0) > (m.away_sets_won or 0)
-        total += 1
-        if home_won_set1 == home_won_match:
-            wins += 1
-    return wins, total
-
-
-def league_win_after_set1_loss(
-    session: Session, league_id: int, as_of: datetime
-) -> tuple[int, int]:
-    """League baseline: matches where the set-1 loser came back to win.
-    Returns (comebacks, total_finished).
-    """
-    matches = session.scalars(
-        select(Match)
-        .where(Match.league_id == league_id)
-        .where(Match.status == "finished")
-        .where(Match.scheduled_at < as_of)
-        .options(selectinload(Match.sets))
-    ).all()
-    total = comebacks = 0
-    for m in matches:
-        if not m.sets:
-            continue
-        s1 = min(m.sets, key=lambda s: s.set_number)
-        home_won_set1 = s1.home_points > s1.away_points
-        home_won_match = (m.home_sets_won or 0) > (m.away_sets_won or 0)
-        total += 1
-        if home_won_set1 != home_won_match:
-            comebacks += 1
-    return comebacks, total
-
-
-# ---------------------------------------------------------------------------
-# After going down 1-1
-# ---------------------------------------------------------------------------
-
-def win_after_going_down_1_1(
-    session: Session, player_id: int, n: int, as_of: datetime
-) -> tuple[int, int]:
-    """When player led 1-0 then lost set 2 (now 1-1), how often did they win?
-    Returns (match_wins, total_where_led_1_0_then_went_1_1).
-    """
-    matches = _player_matches(session, player_id, n, as_of)
-    total = wins = 0
-    for m in matches:
-        sw = _set_wins(m, player_id)
-        if len(sw) >= 2 and sw[0] and not sw[1]:
-            total += 1
-            if _player_won_match(m, player_id):
-                wins += 1
-    return wins, total
-
-
-# ---------------------------------------------------------------------------
-# Set 3 win rate when up 2-0
-# ---------------------------------------------------------------------------
-
-def set3_win_rate_when_up_2_0(
-    session: Session, player_id: int, n: int, as_of: datetime
-) -> tuple[int, int]:
-    """When player was up 2-0 (won sets 1 and 2), how often did they win set 3?
-    Returns (set3_wins, total_where_up_2_0).
-    """
-    matches = _player_matches(session, player_id, n, as_of)
-    total = wins = 0
-    for m in matches:
-        sw = _set_wins(m, player_id)
-        if len(sw) >= 3 and sw[0] and sw[1]:
-            total += 1
-            if sw[2]:
-                wins += 1
-    return wins, total
-
-
-def league_set3_win_rate_when_up_2_0(
-    session: Session, league_id: int, as_of: datetime
-) -> tuple[int, int]:
-    """League baseline: of matches that had a 2-0 leader going into set 3,
-    how often did that leader win set 3?
-    Returns (set3_wins_by_leader, total_where_had_2_0_leader).
-    """
-    matches = session.scalars(
-        select(Match)
-        .where(Match.league_id == league_id)
-        .where(Match.status == "finished")
-        .where(Match.scheduled_at < as_of)
-        .options(selectinload(Match.sets))
-    ).all()
-    total = wins = 0
-    for m in matches:
-        ss = sorted(m.sets, key=lambda s: s.set_number)
-        if len(ss) < 3:
-            continue
-        h1 = ss[0].home_points > ss[0].away_points
-        h2 = ss[1].home_points > ss[1].away_points
-        h3 = ss[2].home_points > ss[2].away_points
-        if h1 and h2:          # home up 2-0
-            total += 1
-            wins += int(h3)
-        elif not h1 and not h2:  # away up 2-0
-            total += 1
-            wins += int(not h3)
-    return wins, total
-
-
-# ---------------------------------------------------------------------------
-# Set 5 win rate
-# ---------------------------------------------------------------------------
-
-def set5_win_rate(
-    session: Session, player_id: int, n: int, as_of: datetime
-) -> tuple[int, int]:
-    """Of last n 5-set matches the player appeared in, how often did they win?
-    Returns (wins, total_set5_appearances).
-    """
-    stmt = (
-        select(Match)
-        .where(or_(Match.home_player_id == player_id, Match.away_player_id == player_id))
-        .where(Match.status == "finished")
-        .where(Match.scheduled_at < as_of)
-        .where(Match.home_sets_won + Match.away_sets_won == 5)
-        .order_by(Match.scheduled_at.desc())
-        .limit(n)
-    )
-    matches = session.scalars(stmt).all()
-    wins = sum(1 for m in matches if _player_won_match(m, player_id))
-    return wins, len(matches)
-
-
-def league_set5_win_rate(
-    session: Session, league_id: int, as_of: datetime
-) -> tuple[int, int]:
-    """League baseline: home player win rate in 5-set matches (should be ~0.5).
-    Returns (home_wins, total_5set_matches).
-    """
-    stmt = (
-        select(
-            func.count(),
-            func.count().filter(Match.home_sets_won > Match.away_sets_won)
-        )
-        .where(Match.league_id == league_id)
-        .where(Match.status == "finished")
-        .where(Match.scheduled_at < as_of)
-        .where(Match.home_sets_won + Match.away_sets_won == 5)
-    )
-    total, home_wins = session.execute(stmt).one()
-    return home_wins, total
-
-
-# ---------------------------------------------------------------------------
-# Average total points
-# ---------------------------------------------------------------------------
-
-def avg_total_points(
-    session: Session, player_id: int, n: int, as_of: datetime
-) -> tuple[int, int]:
-    """Sum of total points across last n finished matches.
-    Returns (total_points_sum, total_matches). Caller divides for average.
-    """
-    matches = _player_matches(session, player_id, n, as_of)
-    total = sum(
-        sum(s.home_points + s.away_points for s in m.sets)
-        for m in matches
-    )
-    return total, len(matches)
-
-
-# ---------------------------------------------------------------------------
-# Split rate
-# ---------------------------------------------------------------------------
-
-def split_rate(
-    session: Session, player_id: int, n: int, as_of: datetime
-) -> tuple[int, int]:
-    """Of last n matches with at least 2 sets, how often was it 1-1 after two sets?
-    Returns (splits, total).
-    """
-    matches = _player_matches(session, player_id, n, as_of)
-    total = splits = 0
-    for m in matches:
-        sw = _set_wins(m, player_id)
-        if len(sw) >= 2:
-            total += 1
-            if sw[0] != sw[1]:
-                splits += 1
-    return splits, total
-
-
-def split_when_lost_set1(
-    session: Session, player_id: int, n: int, as_of: datetime
-) -> tuple[int, int]:
-    """When player lost set 1, how often did they win set 2 (comeback to 1-1)?
-    Returns (set2_wins, total_where_lost_set1).
-    """
-    matches = _player_matches(session, player_id, n, as_of)
-    total = wins = 0
-    for m in matches:
-        sw = _set_wins(m, player_id)
-        if len(sw) >= 2 and not sw[0]:
-            total += 1
-            if sw[1]:
-                wins += 1
-    return wins, total
-
-
-def split_allowed_after_set1_win(
-    session: Session, player_id: int, n: int, as_of: datetime
-) -> tuple[int, int]:
-    """When player won set 1, how often did they lose set 2 (opponent back to 1-1)?
-    Returns (set2_losses, total_where_won_set1).
-    """
-    matches = _player_matches(session, player_id, n, as_of)
-    total = losses = 0
-    for m in matches:
-        sw = _set_wins(m, player_id)
-        if len(sw) >= 2 and sw[0]:
-            total += 1
-            if not sw[1]:
-                losses += 1
-    return losses, total
-
-
-def league_split_rate(
-    session: Session, league_id: int, as_of: datetime
-) -> tuple[int, int]:
-    """League baseline for split rate (1-1 after two sets).
-    Returns (splits, total).
-    """
-    matches = session.scalars(
-        select(Match)
-        .where(Match.league_id == league_id)
-        .where(Match.status == "finished")
-        .where(Match.scheduled_at < as_of)
-        .options(selectinload(Match.sets))
-    ).all()
-    total = splits = 0
-    for m in matches:
-        ss = sorted(m.sets, key=lambda s: s.set_number)
-        if len(ss) >= 2:
-            total += 1
-            s1h = ss[0].home_points > ss[0].away_points
-            s2h = ss[1].home_points > ss[1].away_points
-            if s1h != s2h:
-                splits += 1
-    return splits, total
+def avg_total_summary(session: Session, player_id: int, league_id: int, n: int,
+                      as_of: datetime, prior_strength: float = 10) -> dict:
+    """Mean total points, shrunk toward the league mean like the rates are.
+    No Wilson CI: that's for proportions, not means."""
+    total, sample = avg_total_points(session, player_id, n, as_of)
+    lg_total, lg_n = league_avg_total_points(session, league_id, as_of)
+    baseline = lg_total / lg_n if lg_n else 0.0
+    return {
+        "n": sample,
+        "mean": round(total / sample, 2) if sample else None,
+        "shrunk_mean": round(shrunk_rate(total, sample, baseline, prior_strength), 2),
+        "league_mean": round(baseline, 2),
+        "small_sample": sample < SMALL_SAMPLE,
+    }
