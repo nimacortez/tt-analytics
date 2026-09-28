@@ -2,13 +2,16 @@
 Grade predictions and report Brier score + calibration.
   python -m app.grade
 """
+import math
+from collections.abc import Callable
 from datetime import datetime, timezone
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
 from app.db import SessionLocal
-from app.models import Match, Prediction
+from app.models import Match, Player, Prediction
+from app.stats import league_over_rate
 
 
 def outcome_for(pred: Prediction, match: Match) -> bool | None:
@@ -110,140 +113,93 @@ def calibration_table(
     return result
 
 
-def _oracle_brier(session: Session) -> tuple[float, int]:
-    """Compute oracle Brier score using mock true_skill via p_win.
-    This is a lower bound achievable with perfect knowledge of skills.
-    """
-    from app.providers.mock import MockProvider
-    from app.models import Player
-    from app.ratings import p_win
+def _brier_of(session: Session, market: str, model_version: str,
+              prob_fn: Callable[[Prediction, Match], float | None]) -> tuple[float, int]:
+    """Brier of an alternative probability (baseline, oracle) on the same graded
+    predictions as the model, so the numbers are directly comparable."""
+    rows = session.execute(
+        select(Prediction, Match)
+        .join(Match, Match.id == Prediction.match_id)
+        .where(Prediction.market == market)
+        .where(Prediction.model_version == model_version)
+        .where(Prediction.outcome.is_not(None))
+    ).all()
+    total = 0.0
+    counted = 0
+    for pred, match in rows:
+        prob = prob_fn(pred, match)
+        if prob is None:
+            continue
+        total += (prob - float(pred.outcome)) ** 2
+        counted += 1
+    return (total / counted if counted else 0.0), counted
+
+
+def _oracle(session: Session) -> Callable[[Prediction, Match], float | None]:
+    """Mock-only: the true probabilities, from hidden skills through the exact points
+    model (which is how the mock generates matches). The best Brier any model can get."""
+    from app.points import match_distribution
+    from app.providers.mock import POINT_SCALE, MockProvider
 
     provider = MockProvider()
-    players = session.scalars(select(Player)).all()
-    pid_to_api = {p.id: p.api_id for p in players}
+    api_ids = dict(session.execute(select(Player.id, Player.api_id)).tuples().all())
 
-    preds = session.scalars(
-        select(Prediction)
-        .where(Prediction.market == "match_winner")
-        .where(Prediction.model_version == "v1")
-        .where(Prediction.outcome.is_not(None))
-    ).all()
-
-    if not preds:
-        return 0.0, 0
-
-    # Pre-load the match home/away for each prediction
-    match_ids = {p.match_id for p in preds}
-    matches = {
-        m.id: m for m in session.scalars(
-            select(Match).where(Match.id.in_(match_ids))
-        ).all()
-    }
-
-    total = 0.0
-    counted = 0
-    for pred in preds:
-        m = matches[pred.match_id]
-        h_api = pid_to_api.get(m.home_player_id, "")
-        a_api = pid_to_api.get(m.away_player_id, "")
+    def prob(pred: Prediction, match: Match) -> float | None:
         try:
-            h_skill = provider.true_skill(h_api)
-            a_skill = provider.true_skill(a_api)
+            gap = (provider.true_skill(api_ids[match.home_player_id])
+                   - provider.true_skill(api_ids[match.away_player_id]))
         except KeyError:
-            continue
-        # Convert skills to win probability using same Bradley-Terry as mock
-        import math
-        p_home_point = 1 / (1 + math.exp(-0.12 * (h_skill - a_skill)))
-        # Use p_win with ratings derived from skills (scale to Elo range)
-        oracle_prob = p_home_point  # direct skill-based prob (not Elo-derived)
-        total += (oracle_prob - float(pred.outcome)) ** 2
-        counted += 1
+            return None
+        dist = match_distribution(1 / (1 + math.exp(-POINT_SCALE * gap)))
+        if pred.market == "match_winner":
+            return dist.p_home_win
+        if pred.market == "total_over":
+            return dist.p_over(pred.line)
+        return None
 
-    return total / counted if counted else 0.0, counted
+    return prob
 
 
-def _historical_over_brier(session: Session, line: float = 74.5) -> tuple[float, int]:
-    """Historical over-rate baseline Brier for total_over predictions.
+def _league_over_baseline(session: Session) -> Callable[[Prediction, Match], float]:
+    """Naive totals baseline: the league's over rate at this line, as of the match."""
+    def prob(pred: Prediction, match: Match) -> float:
+        hits, n = league_over_rate(session, match.league_id, pred.line, pred.as_of)
+        return hits / n if n else 0.5
+    return prob
 
-    Uses each match's league over rate as_of match time as the predicted probability.
-    """
-    from app.stats import league_over_rate
-    from app.models import League
 
-    preds = session.scalars(
-        select(Prediction)
-        .where(Prediction.market == "total_over")
-        .where(Prediction.model_version == "v1")
-        .where(Prediction.outcome.is_not(None))
-    ).all()
-
-    if not preds:
-        return 0.0, 0
-
-    match_ids = {p.match_id for p in preds}
-    matches = {
-        m.id: m for m in session.scalars(
-            select(Match).where(Match.id.in_(match_ids))
-        ).all()
-    }
-
-    total = 0.0
-    counted = 0
-    for pred in preds:
-        m = matches.get(pred.match_id)
-        if not m:
-            continue
-        lg_hits, lg_total = league_over_rate(session, m.league_id, line, pred.as_of)
-        hist_prob = lg_hits / lg_total if lg_total else 0.5
-        total += (hist_prob - float(pred.outcome)) ** 2
-        counted += 1
-
-    return total / counted if counted else 0.0, counted
+MODELS = [
+    # (market, model_version, label, naive baseline label, naive baseline)
+    ("match_winner", "v1", "Elo v1", "Always 0.5", lambda s: (lambda p, m: 0.5)),
+    ("total_over", "v1", "Points model v1", "League over rate", _league_over_baseline),
+]
 
 
 def report(session: Session) -> None:
-    """Print Brier scores and calibration tables for all markets."""
+    """Print Brier scores (naive baseline / model / oracle) and calibration per market."""
     graded = grade_predictions(session)
     if graded:
         print(f"Graded {graded} new predictions")
 
-    print("\n=== Brier Scores (match_winner) ===")
-    elo_score, elo_n = brier_score(session, "match_winner", "v1")
-    baseline = 0.25
-    oracle_score, oracle_n = _oracle_brier(session)
-
-    print(f"  Always-0.5 baseline:  {baseline:.4f}")
-    print(f"  Elo v1:               {elo_score:.4f}  (n={elo_n})")
-    print(f"  Oracle (true_skill):  {oracle_score:.4f}  (n={oracle_n})")
-
-    if elo_n > 0 and elo_score > baseline:
-        print("  *** WARNING: Elo Brier score is ABOVE the always-0.5 baseline! ***")
-
-    print("\n=== Calibration (match_winner, elo v1) ===")
-    print(f"  {'bin':>12}  {'n':>5}  {'mean_p':>7}  {'actual':>7}")
-    for row in calibration_table(session, "match_winner", "v1"):
-        if row["n"] == 0:
+    oracle = _oracle(session)
+    for market, version, label, base_label, base_fn in MODELS:
+        model_score, n = brier_score(session, market, version)
+        print(f"\n=== {market} ({label}), n={n} ===")
+        if not n:
             continue
-        print(f"  {row['bin_low']:.2f}–{row['bin_high']:.2f}  "
-              f"{row['n']:>5}  {row['mean_prob']:>7.3f}  {row['actual_rate']:>7.3f}")
+        base_score, _ = _brier_of(session, market, version, base_fn(session))
+        oracle_score, oracle_n = _brier_of(session, market, version, oracle)
+        print(f"  {base_label + ':':<22}{base_score:.4f}")
+        print(f"  {label + ':':<22}{model_score:.4f}")
+        print(f"  {'Oracle (true skill):':<22}{oracle_score:.4f}  (n={oracle_n})")
+        if model_score > base_score:
+            print("  *** WARNING: model is WORSE than the naive baseline ***")
 
-    print("\n=== Brier Scores (total_over, line=74.5) ===")
-    pts_score, pts_n = brier_score(session, "total_over", "v1")
-    hist_score, hist_n = _historical_over_brier(session)
-
-    print(f"  Historical baseline:  {hist_score:.4f}  (n={hist_n})")
-    print(f"  Points model v1:      {pts_score:.4f}  (n={pts_n})")
-
-    if pts_n > 0 and hist_n > 0 and pts_score > hist_score:
-        print("  *** WARNING: Points model Brier is ABOVE historical baseline! ***")
-
-    print("\n=== Calibration (total_over, points_model v1) ===")
-    print(f"  {'bin':>12}  {'n':>5}  {'mean_p':>7}  {'actual':>7}")
-    for row in calibration_table(session, "total_over", "v1"):
-        if row["n"] == 0:
-            continue
-        print(f"  {row['bin_low']:.2f}–{row['bin_high']:.2f}  "
-              f"{row['n']:>5}  {row['mean_prob']:>7.3f}  {row['actual_rate']:>7.3f}")
+        print(f"  {'bin':>12}  {'n':>5}  {'mean_p':>7}  {'actual':>7}")
+        for row in calibration_table(session, market, version):
+            if row["n"]:
+                print(f"  {row['bin_low']:.2f}-{row['bin_high']:.2f}  "
+                      f"{row['n']:>5}  {row['mean_prob']:>7.3f}  {row['actual_rate']:>7.3f}")
 
 
 if __name__ == "__main__":

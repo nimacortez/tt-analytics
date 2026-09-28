@@ -30,6 +30,7 @@ backend/app/
                      (sweep, set conditionals, 3 split variants) via player_set_stat /
                      league_set_stat / set_stat_summary; h2h_record; avg_total_points (+ summary)
   ratings.py         Elo: rebuild() full chronological recompute, rating_as_of(), p_win()
+  points.py          points-total model: exact P(total > line) + P(home wins) from P(home wins a point)
   predict.py         log_* functions write one predictions row per (match, market, line, model_version)
   grade.py           outcome_for() per market, grade_predictions(), brier_score(), calibration_table()
   main.py            FastAPI: /health, /matches
@@ -58,9 +59,11 @@ pytest suite (tests/). Elo (ratings.py, K=32, start 1500): Spearman rho vs true_
 Predictions table + logging + grading. Markets: match_winner (probability = P(home wins), line = -1 sentinel so the unique key works) and total_over (P(total > line)). Grading is per market; walkovers/retirements are never graded. Elo v1 match_winner: Brier 0.1955 vs 0.25 coin flip, n=4277, calibration within ~3pts per decile. New market = add a branch in grade.outcome_for() + a test.
 Set-sequence stats: each is a rule (sets won in order, won match) -> None/hit/miss in stats.SET_STATS. Player version = last n finished matches, then filter to qualifying ones (so n_qualifying <= n); league baseline = all league matches from both players' sides (n = player-matches). Split = loser of set 1 wins set 2. Three versions: split (match-level), split_after_losing_set1, split_allowed_after_winning_set1. League-wide all three rates are equal by construction (~0.426 on mock); only the player-level versions carry information, and each qualifies on ~half of matches, so samples are small. New stat = one entry in SET_STATS + expected value in tests/test_advanced_stats.py (a test fails if it's missing).
 League baselines load every league match in Python; fine at mock scale, first candidate for SQL/caching if the API gets slow.
+Points-total model (points.py). Each player's share of points over last 20 matches (set scores only, shrunk toward 0.5 with 50 points of prior) -> log5 -> P(home wins a point) -> exact distribution of match total (closed-form set scores + DP over best of 5; no Monte Carlo). Gives P(over) at any line and P(home wins). Design call: inputs are set-level, but the model assumes points are iid, which is point-level math; accepted deliberately. The mock generates data with exactly this assumption, so mock results flatter it; expect worse on real data.
+Totals results (line 74.5, n=4277): league over rate 0.2495, points model 0.2446, oracle 0.2406. Totals are mostly noise even with perfect knowledge; the model gets ~55% of the achievable gain. Oracle is well calibrated (math verified); model tails (p < 0.2, n~112) are too extreme. Shrinkage sweep (0/50/300/1000 points) didn't help, in-sample.
+Oracle (grade.py, mock only): true skills through the same exact model. Elo match_winner: 0.25 / 0.1955 / oracle 0.1873, so Elo gets ~87% of the achievable gain.
 
 Next (in order)
-Points-total distribution model (for P(over line) at any line).
 Next.js UI (match list, filters by league, adjustable line).
 NL -> typed filter.
 Agent layer (open-ended questions only).
