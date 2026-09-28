@@ -13,6 +13,9 @@ docker compose up -d              # from repo root; Docker Desktop must be runni
 python -m app.init_db             # create tables (--reset to drop first)
 python -m app.ingest --days 30    # load mock data
 python -m app.ratings --check     # rebuild Elo; print Spearman rho vs mock true_skill
+python -m app.predict --backfill  # log predictions for past finished matches (as_of = kickoff)
+python -m app.predict             # log predictions for scheduled matches (as_of = now)
+python -m app.grade               # grade finished matches; print Brier + calibration
 uvicorn app.main:app --reload     # API at http://localhost:8000/docs
 python -m pytest -q               # tests run on in-memory SQLite, no Docker needed
 Layout
@@ -25,6 +28,8 @@ backend/app/
   ingest.py          provider -> Postgres via upserts keyed on api_id
   stats.py           over_hit_rate, league_over_rate, wilson_interval, shrunk_rate, over_summary
   ratings.py         Elo: rebuild() full chronological recompute, rating_as_of(), p_win()
+  predict.py         log_* functions write one predictions row per (match, market, line, model_version)
+  grade.py           outcome_for() per market, grade_predictions(), brier_score(), calibration_table()
   main.py            FastAPI: /health, /matches
 backend/tests/
   conftest.py        `session` fixture: in-memory SQLite (JSONB patched to JSON)
@@ -48,9 +53,9 @@ Status
 
 Done: schema, provider interface, mock provider, ingestion, /matches API, over/under hit rate with Wilson CI + shrinkage (over_summary, prior_strength=10 is a guess).
 pytest suite (tests/). Elo (ratings.py, K=32, start 1500): Spearman rho vs true_skill on 30 days of mock data = czech 0.930, elite 0.906, setka 0.850, ttcup 0.889. Mock points are iid given skill, so real data will be noisier.
+Predictions table + logging + grading. Markets: match_winner (probability = P(home wins), line = -1 sentinel so the unique key works) and total_over (P(total > line)). Grading is per market; walkovers/retirements are never graded. Elo v1 match_winner: Brier 0.1955 vs 0.25 coin flip, n=4277, calibration within ~3pts per decile. New market = add a branch in grade.outcome_for() + a test.
 
 Next (in order)
-predictions table + logging, started NOW rather than at the end: what was predicted, model probability, model version, inputs/as_of, created_at; graded later against results. Brier score + calibration from day one.
 More stats with the same as_of + shrinkage pattern: H2H, sweeps %, splits %, set conditionals (win % if up 1-0, set 3 sweep when up 2-0, set 5 at 2-2), avg total points.
 Points-total distribution model (for P(over line) at any line).
 Next.js UI (match list, filters by league, adjustable line).
